@@ -10,13 +10,26 @@
 - 支持动态决策：LLM 可根据实时输出决定下一步操作
 - 支持用户交互（如 sudo 密码输入）
 
+心跳与重连特性（适用于远程 workspace）：
+- 自动心跳：定期发送 keepalive 保持连接活跃
+- 自动重连：连接断开时自动尝试重连
+- 健康检查：检测连接是否有效
+
 使用方法：
+    # 方式1：使用上下文管理器（推荐）
+    with connect_workspace("192.168.1.100", username="user", password="pass") as session:
+        result = session.execute_and_return("df -h")
+    
+    # 方式2：手动管理
     session = SSHSession()
     session.connect(host, port, username, password/key)
     result = session.execute_and_return("df -h")  # 阻塞模式
     session.start_streaming("tail -f /var/log/syslog")  # 流式模式
     output = session.read_output()  # 读取缓冲区
     session.close()
+    
+    # 方式3：快速执行
+    output = quick_execute("192.168.1.100", "ls -la", password="pass")
 """
 
 import os
@@ -104,9 +117,20 @@ class SSHSession:
     
     支持阻塞和流式两种执行模式。
     线程安全，支持多个并发流式会话。
+    
+    特性：
+    - 自动心跳：定期发送 keepalive 保持连接活跃
+    - 自动重连：连接断开时自动尝试重连
+    - 健康检查：检测连接是否有效
     """
     
-    def __init__(self):
+    def __init__(self, keepalive_interval: int = 30, auto_reconnect: bool = True):
+        """初始化 SSH 会话
+        
+        Args:
+            keepalive_interval: 心跳间隔（秒），建议 < 10 分钟
+            auto_reconnect: 是否自动重连
+        """
         self.client: Optional[paramiko.SSHClient] = None
         self.host: Optional[str] = None
         self.port: int = 22
@@ -115,6 +139,14 @@ class SSHSession:
         self.lock = threading.Lock()
         self.streaming_sessions: Dict[str, StreamingSession] = {}
         self._session_counter = 0
+        
+        # 新增：连接参数存储（用于重连）
+        self._connect_params: Dict[str, Any] = {}
+        self._keepalive_interval = keepalive_interval
+        self._auto_reconnect = auto_reconnect
+        self._heartbeat_thread: Optional[threading.Thread] = None
+        self._heartbeat_running = False
+        self._last_activity_time = time.time()
     
     def connect(self, host: str, port: int = 22, username: str = "root",
                 password: Optional[str] = None, key_filename: Optional[str] = None,
@@ -141,6 +173,17 @@ class SSHSession:
         
         try:
             self.client = paramiko.SSHClient()
+            
+            # 保存连接参数（用于重连）
+            self._connect_params = {
+                "host": host,
+                "port": port,
+                "username": username,
+                "password": password,
+                "key_filename": key_filename,
+                "timeout": timeout,
+                "known_hosts_policy": known_hosts_policy,
+            }
             
             # 设置主机密钥策略
             if known_hosts_policy == "strict":
@@ -180,6 +223,10 @@ class SSHSession:
             self.port = port
             self.username = username
             self.connected = True
+            self._last_activity_time = time.time()
+            
+            # 启动心跳线程
+            self._start_heartbeat()
             
             # 测试连接
             transport = self.client.get_transport()
@@ -201,6 +248,78 @@ class SSHSession:
         except Exception as e:
             return {"status": "error", "msg": f"连接失败: {str(e)}"}
     
+    def _start_heartbeat(self):
+        """启动心跳线程"""
+        if self._heartbeat_running:
+            return
+        
+        self._heartbeat_running = True
+        
+        def heartbeat_loop():
+            while self._heartbeat_running and self.connected:
+                try:
+                    # 发送 keepalive 数据包
+                    if self.client and self.client.get_transport():
+                        self.client.get_transport().send_ignore()
+                        self._last_activity_time = time.time()
+                except Exception:
+                    # 连接可能已断开，尝试重连
+                    if self._auto_reconnect:
+                        self._reconnect()
+                    else:
+                        self.connected = False
+                        break
+                
+                time.sleep(self._keepalive_interval)
+        
+        self._heartbeat_thread = threading.Thread(target=heartbeat_loop, daemon=True)
+        self._heartbeat_thread.start()
+    
+    def _stop_heartbeat(self):
+        """停止心跳线程"""
+        self._heartbeat_running = False
+        if self._heartbeat_thread:
+            self._heartbeat_thread.join(timeout=2)
+            self._heartbeat_thread = None
+    
+    def _reconnect(self) -> bool:
+        """尝试重新连接"""
+        if not self._connect_params:
+            return False
+        
+        try:
+            # 清理旧连接
+            if self.client:
+                try:
+                    self.client.close()
+                except:
+                    pass
+                self.client = None
+            
+            self.connected = False
+            
+            # 重新连接
+            result = self.connect(**self._connect_params)
+            return result["status"] == "success"
+        except Exception:
+            return False
+    
+    def is_alive(self) -> bool:
+        """检查连接是否存活"""
+        if not self.connected or not self.client:
+            return False
+        
+        try:
+            transport = self.client.get_transport()
+            if transport and transport.is_active():
+                # 发送 keepalive 测试
+                transport.send_ignore()
+                return True
+        except:
+            pass
+        
+        return False
+    
     def execute_and_return(self, command: str, timeout: int = 60, 
                            get_pty: bool = False) -> CommandResult:
         """阻塞模式执行命令，返回完整结果
@@ -216,12 +335,17 @@ class SSHSession:
             CommandResult 对象
         """
         if not self.connected or not self.client:
-            return CommandResult(
-                exit_code=-1,
-                stdout="",
-                stderr="未连接到远程服务器",
-                timed_out=False
-            )
+            # 尝试重连
+            if self._auto_reconnect and self._reconnect():
+                # 重连成功，继续执行
+                pass
+            else:
+                return CommandResult(
+                    exit_code=-1,
+                    stdout="",
+                    stderr="未连接到远程服务器",
+                    timed_out=False
+                )
         
         try:
             stdin, stdout, stderr = self.client.exec_command(
@@ -234,6 +358,9 @@ class SSHSession:
             stdout_text = stdout.read().decode('utf-8', errors='replace')
             stderr_text = stderr.read().decode('utf-8', errors='replace')
             exit_code = stdout.channel.recv_exit_status()
+            
+            # 更新活动时间
+            self._last_activity_time = time.time()
             
             return CommandResult(
                 exit_code=exit_code,
@@ -478,6 +605,9 @@ class SSHSession:
     def close(self) -> Dict[str, Any]:
         """关闭所有连接和会话"""
         try:
+            # 停止心跳
+            self._stop_heartbeat()
+            
             # 停止所有流式会话（在锁内通过 _internal 标记避免死锁）
             with self.lock:
                 for session_id in list(self.streaming_sessions.keys()):
@@ -497,6 +627,29 @@ class SSHSession:
         
         except Exception as e:
             return {"status": "error", "msg": f"关闭连接失败: {str(e)}"}
+    
+    def __enter__(self):
+        """支持 with 语句"""
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """支持 with 语句，自动关闭连接"""
+        self.close()
+        return False
+    
+    def get_status(self) -> Dict[str, Any]:
+        """获取连接状态信息"""
+        return {
+            "connected": self.connected,
+            "host": self.host,
+            "port": self.port,
+            "username": self.username,
+            "is_alive": self.is_alive(),
+            "last_activity": self._last_activity_time,
+            "auto_reconnect": self._auto_reconnect,
+            "keepalive_interval": self._keepalive_interval,
+            "streaming_sessions_count": len(self.streaming_sessions),
+        }
 
 
 # 全局会话管理器
@@ -524,7 +677,8 @@ def _get_session(session_id: Optional[str] = None,
 
 def ssh_connect(host: str, port: int = 22, username: str = "root",
                 password: Optional[str] = None, key_filename: Optional[str] = None,
-                session_id: Optional[str] = None, timeout: int = 10) -> Dict[str, Any]:
+                session_id: Optional[str] = None, timeout: int = 10,
+                keepalive_interval: int = 30, auto_reconnect: bool = True) -> Dict[str, Any]:
     """连接到远程 SSH 服务器
     
     Args:
@@ -535,6 +689,8 @@ def ssh_connect(host: str, port: int = 22, username: str = "root",
         key_filename: 私钥文件路径
         session_id: 会话 ID（可选，默认自动生成）
         timeout: 连接超时
+        keepalive_interval: 心跳间隔（秒），建议 < 10 分钟
+        auto_reconnect: 是否自动重连
     
     Returns:
         包含连接状态的字典
@@ -542,7 +698,7 @@ def ssh_connect(host: str, port: int = 22, username: str = "root",
     if not session_id:
         session_id = f"ssh_{host}_{port}_{username}"
     
-    session = SSHSession()
+    session = SSHSession(keepalive_interval=keepalive_interval, auto_reconnect=auto_reconnect)
     result = session.connect(host, port, username, password, key_filename, timeout)
     
     if result["status"] == "success":
@@ -638,13 +794,17 @@ def ssh_list_sessions() -> Dict[str, Any]:
     }
     
     for sid, session in _sessions.items():
-        result["active_sessions"].append({
+        session_info = {
             "session_id": sid,
             "host": session.host,
             "port": session.port,
             "username": session.username,
             "connected": session.connected,
-        })
+            "is_alive": session.is_alive(),
+            "last_activity": session._last_activity_time,
+            "auto_reconnect": session._auto_reconnect,
+        }
+        result["active_sessions"].append(session_info)
     
     # 获取流式会话信息
     for session in _sessions.values():
@@ -706,6 +866,36 @@ def quick_execute(host: str, command: str, username: str = "root",
         return result.get("stdout", "")
     else:
         return f"[Error] {result.get('stderr', result.get('msg', 'Unknown error'))}"
+
+
+def connect_workspace(host: str, port: int = 22, username: str = "root",
+                      password: Optional[str] = None, 
+                      session_id: Optional[str] = None) -> Dict[str, Any]:
+    """连接远程 workspace（优化配置）
+    
+    针对 10 分钟超时的 workspace 优化：
+    - 心跳间隔：2 分钟（确保在 10 分钟内有活动）
+    - 自动重连：开启
+    
+    Args:
+        host: 主机地址
+        port: SSH 端口
+        username: 用户名
+        password: 密码
+        session_id: 会话 ID
+    
+    Returns:
+        包含连接状态的字典
+    """
+    return ssh_connect(
+        host=host,
+        port=port,
+        username=username,
+        password=password,
+        session_id=session_id,
+        keepalive_interval=120,  # 2 分钟心跳
+        auto_reconnect=True
+    )
 
 
 if __name__ == "__main__":
